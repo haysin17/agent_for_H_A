@@ -1,17 +1,32 @@
 import json
+from types import SimpleNamespace
 from unittest.mock import patch
+
+import pytest
 
 from ha_agent import ha_client
 from ha_agent.agent import (
     _serialize_tool_output,
     deliver_attachment,
+    run_agent,
     trim_history,
 )
 from ha_agent.config import DEFAULT_OLLAMA_CA_CERT, Settings
 from ha_agent.telegram_bot import TelegramBot, _format_exception_for_log
-from ha_agent.tools import Attachment, REGISTRY, ToolContext, ollama_tools
+from ha_agent.tools import (
+    Attachment,
+    REGISTRY,
+    ToolContext,
+    invoke_tool,
+    ollama_tools,
+)
 from ha_agent.tools.control import call_service
-from ha_agent.tools.entities import get_state, get_weather
+from ha_agent.tools.entities import (
+    get_state,
+    get_weather,
+    list_entities,
+    list_temperature_entities,
+)
 
 
 def make_context(confirmation_callback=None):
@@ -164,6 +179,177 @@ def test_path_components_are_rejected_before_home_assistant_request():
 
     assert "error" in result
     get.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "exception_type",
+    [ha_client.requests.ConnectionError, ha_client.requests.Timeout],
+)
+def test_home_assistant_connection_errors_are_reported_to_the_model(
+    exception_type,
+):
+    with patch.object(
+        ha_client.requests,
+        "get",
+        side_effect=exception_type("unreachable"),
+    ):
+        result = invoke_tool(
+            "get_state",
+            {"entity_id": "sensor.room"},
+            make_context(),
+        )
+
+    assert result["error_code"] == "home_assistant_unavailable"
+    assert "Home Assistant" in result["error"]
+
+
+def test_health_check_reports_current_home_assistant_connection():
+    response = ha_client.requests.Response()
+    response.status_code = 200
+    with patch.object(
+        ha_client.requests,
+        "get",
+        return_value=response,
+    ) as get:
+        result = invoke_tool(
+            "check_ha_connection",
+            {},
+            make_context(),
+        )
+
+    assert result == {"connected": True}
+    get.assert_called_once_with(
+        "http://ha/api/",
+        headers={"Authorization": "Bearer test-token"},
+        timeout=10,
+    )
+
+
+def test_entity_search_matches_room_names_with_spaces_and_underscores():
+    states = [
+        {
+            "entity_id": "sensor.living_room_temperature",
+            "state": "21",
+            "attributes": {"friendly_name": "Living Room temperature"},
+        },
+        {
+            "entity_id": "sensor.bathroom_temperature",
+            "state": "23",
+            "attributes": {"friendly_name": "Bathroom temperature"},
+        },
+    ]
+    with patch.object(ha_client, "get_states", return_value=states):
+        result = list_entities(
+            "sensor",
+            search="living room",
+            context=make_context(),
+        )
+
+    assert [entity["entity_id"] for entity in result["entities"]] == [
+        "sensor.living_room_temperature"
+    ]
+
+
+def test_temperature_listing_filters_sensor_and_climate_entities():
+    states = [
+        {
+            "entity_id": "sensor.room_temp",
+            "state": "21.5",
+            "attributes": {
+                "friendly_name": "Вітальня",
+                "device_class": "temperature",
+                "unit_of_measurement": "°C",
+            },
+        },
+        {
+            "entity_id": "sensor.room_humidity",
+            "state": "45",
+            "attributes": {
+                "friendly_name": "Вологість",
+                "device_class": "humidity",
+                "unit_of_measurement": "%",
+            },
+        },
+        {
+            "entity_id": "climate.living_room",
+            "state": "heat",
+            "attributes": {
+                "friendly_name": "Термостат вітальні",
+                "current_temperature": 20.5,
+                "temperature_unit": "°C",
+            },
+        },
+    ]
+    with patch.object(ha_client, "get_states", return_value=states):
+        result = list_temperature_entities(context=make_context())
+
+    assert result["total_matching"] == 2
+    assert [entity["entity_id"] for entity in result["entities"]] == [
+        "sensor.room_temp",
+        "climate.living_room",
+    ]
+    assert result["entities"][0]["temperature"] == "21.5"
+    assert result["entities"][1]["temperature"] == 20.5
+
+
+def test_agent_returns_model_response_after_home_assistant_disconnect():
+    function = SimpleNamespace(
+        name="get_state",
+        arguments={"entity_id": "sensor.room"},
+    )
+    tool_call = SimpleNamespace(function=function)
+    responses = [
+        SimpleNamespace(
+            message=SimpleNamespace(content="", tool_calls=[tool_call])
+        ),
+        SimpleNamespace(
+            message=SimpleNamespace(
+                content="Зараз немає зв'язку з Home Assistant.",
+                tool_calls=[],
+            )
+        ),
+    ]
+    tool_result = {}
+
+    class FakeClient:
+        def chat(self, **kwargs):
+            if len(responses) == 1:
+                tool_result["message"] = kwargs["messages"][-1]
+            return responses.pop(0)
+
+    with patch.object(
+        ha_client.requests,
+        "get",
+        side_effect=ha_client.requests.ConnectionError("unreachable"),
+    ):
+        answer = run_agent(
+            "Яка температура?",
+            [],
+            FakeClient(),
+            Settings(ha_url="http://ha", ha_token="test-token"),
+        )
+
+    assert answer == "Зараз немає зв'язку з Home Assistant."
+    assert json.loads(tool_result["message"]["content"])["error_code"] == (
+        "home_assistant_unavailable"
+    )
+
+
+def test_home_assistant_gateway_errors_are_reported_as_unavailable():
+    response = ha_client.requests.Response()
+    response.status_code = 503
+    with patch.object(
+        ha_client.requests,
+        "get",
+        return_value=response,
+    ):
+        result = invoke_tool(
+            "get_state",
+            {"entity_id": "sensor.room"},
+            make_context(),
+        )
+
+    assert result["error_code"] == "home_assistant_unavailable"
 
 
 def test_weather_tool_returns_current_conditions_and_capped_forecast():

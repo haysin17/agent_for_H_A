@@ -1,8 +1,23 @@
+import re
 from typing import Optional
 
 from .. import ha_client
 from ..config import READ_DOMAINS, is_valid_entity_id
 from . import ToolContext, tool
+
+
+def _normalize_search(value):
+    return re.sub(r"[\s_-]+", "", value.casefold())
+
+
+@tool(
+    "check_ha_connection",
+    "Перевірити поточне з'єднання з Home Assistant.",
+    {},
+)
+def check_ha_connection(context: Optional[ToolContext] = None):
+    ha_client.check_api_connection(context.settings)
+    return {"connected": True}
 
 
 @tool(
@@ -24,11 +39,13 @@ def list_entities(domain, search=None, context: Optional[ToolContext] = None):
         if state["entity_id"].startswith(domain + ".")
     ]
     if search:
-        needle = search.casefold()
+        needle = _normalize_search(search)
         states = [
             state for state in states
-            if needle in state["entity_id"].casefold()
-            or needle in str(state["attributes"].get("friendly_name") or "").casefold()
+            if needle in _normalize_search(state["entity_id"])
+            or needle in _normalize_search(
+                str(state["attributes"].get("friendly_name") or "")
+            )
         ]
     return {
         "entities": [
@@ -41,6 +58,56 @@ def list_entities(domain, search=None, context: Optional[ToolContext] = None):
         ],
         "truncated": len(states) > 100,
         "total_matching": len(states),
+    }
+
+
+@tool(
+    "list_temperature_entities",
+    "Повернути поточні показники температурних sensor і climate-сутностей. "
+    "Для температури в усьому будинку викликай без search; search використовуй "
+    "лише якщо потрібна конкретна кімната.",
+    {"search": {"type": "string", "maxLength": 100}},
+)
+def list_temperature_entities(search=None, context: Optional[ToolContext] = None):
+    if search is not None and (not isinstance(search, str) or len(search) > 100):
+        return {"error": "search має бути текстом до 100 символів"}
+
+    needle = _normalize_search(search) if search else None
+    results = []
+    for state in ha_client.get_states(context.settings):
+        entity_id = state["entity_id"]
+        domain = entity_id.split(".", 1)[0]
+        attributes = state.get("attributes", {})
+        if domain == "sensor":
+            unit = attributes.get("unit_of_measurement")
+            if (
+                attributes.get("device_class") != "temperature"
+                and unit not in {"°C", "°F", "K"}
+            ):
+                continue
+            temperature = state["state"]
+        elif domain == "climate" and "current_temperature" in attributes:
+            temperature = attributes["current_temperature"]
+            unit = attributes.get("temperature_unit")
+        else:
+            continue
+
+        name = attributes.get("friendly_name") or entity_id
+        if needle and needle not in _normalize_search(
+            f"{entity_id} {name}"
+        ):
+            continue
+        results.append({
+            "entity_id": entity_id,
+            "name": name,
+            "temperature": temperature,
+            "unit": unit,
+        })
+
+    return {
+        "entities": results[:100],
+        "truncated": len(results) > 100,
+        "total_matching": len(results),
     }
 
 

@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import Callable, Optional
 
+from ..ha_client import HomeAssistantUnavailable
 from ..config import Settings
 
 
@@ -69,7 +70,13 @@ def invoke_tool(name, arguments, context):
             "unexpected": sorted(extra_args),
             "missing": sorted(missing_args),
         }
-    return definition["function"](**arguments, context=context)
+    try:
+        return definition["function"](**arguments, context=context)
+    except HomeAssistantUnavailable as exc:
+        return {
+            "error_code": "home_assistant_unavailable",
+            "error": str(exc),
+        }
 
 
 from . import control, entities, history
