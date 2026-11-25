@@ -53,13 +53,6 @@ def ollama_tools():
     ]
 
 
-def tool_schemas():
-    return {
-        name: definition["schema"]
-        for name, definition in REGISTRY.items()
-    }
-
-
 def invoke_tool(name, arguments, context):
     definition = REGISTRY.get(name)
     if definition is None:
@@ -91,5 +84,4 @@ __all__ = [
     "invoke_tool",
     "ollama_tools",
     "tool",
-    "tool_schemas",
 ]
