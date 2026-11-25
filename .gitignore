@@ -1,0 +1,12 @@
+.venv/
+.continue/
+__pycache__/
+.pytest_cache/
+дані.txt
+.env
+.env.*
+!.env.example
+*.crt
+*.pem
+*.key
+*.log
